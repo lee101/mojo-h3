@@ -1,6 +1,7 @@
 """C ABI for the H3 hierarchy and spherical-distance kernels."""
 
-from std.math import atan2, cos, sin, sqrt
+from std.math import atan2, cos, iota, sin, sqrt
+from std.sys.info import simd_width_of as simdwidthof
 
 comptime IPtr = UnsafePointer[Int, AnyOrigin[mut=True]]
 comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
@@ -94,6 +95,57 @@ def has_pentagon_deleted_direction(h: Int, current: Int) -> Bool:
     return True
 
 
+def child_template(h: Int, target: Int, current: Int) -> Int:
+    var value = with_resolution(h, target)
+    for r in range(current + 1, target + 1):
+        value = set_digit(value, r, 0)
+    return value
+
+
+def child_from_code(base: Int, code: Int, target: Int, current: Int) -> Int:
+    var value = base
+    var digits = code
+    for r in range(target, current, -1):
+        value |= (digits % 7) << (3 * (15 - r))
+        digits /= 7
+    return value
+
+
+def write_hex_children(dst: IPtr, h: Int, target: Int, current: Int, start: Int, end: Int):
+    comptime W = simdwidthof[DType.float64]()
+    var base = child_template(h, target, current)
+    var code = start
+    while code + W <= end:
+        var codes = iota[DType.int, W](code)
+        var values = SIMD[DType.int, W](base)
+        for r in range(target, current, -1):
+            values |= (codes % 7) << (3 * (15 - r))
+            codes /= 7
+        dst.store(code, values)
+        code += W
+    while code < end:
+        dst[code] = child_from_code(base, code, target, current)
+        code += 1
+
+
+def increment_child(value: Int, target: Int, current: Int) -> Int:
+    var result = value
+    for r in range(target, current, -1):
+        var d = digit(result, r)
+        if d < 6:
+            return set_digit(result, r, d + 1)
+        result = set_digit(result, r, 0)
+    return result
+
+
+def deleted_pentagon_child(value: Int, target: Int, current: Int) -> Bool:
+    for r in range(current + 1, target + 1):
+        var d = digit(value, r)
+        if d != 0:
+            return d == 1
+    return False
+
+
 def distance_rads(lat1: Float64, lng1: Float64, lat2: Float64, lng2: Float64) -> Float64:
     var dlat = (lat2 - lat1) * 0.5
     var dlng = (lng2 - lng1) * 0.5
@@ -162,22 +214,35 @@ def mjh_cell_to_children(h: Int, target: Int, dst_addr: Int, dst_len: Int) abi("
     var dst = IPtr(unsafe_from_address=dst_addr)
     var current = resolution(h)
     var span = pow7(target - current)
-    var written = 0
     var starts_in_deleted_direction = has_pentagon_deleted_direction(h, current)
+    if not starts_in_deleted_direction:
+        write_hex_children(dst, h, target, current, 0, span)
+        return span
+
+    var written = 0
+    var value = child_template(h, target, current)
     for code in range(span):
-        var value = with_resolution(h, target)
-        var digits = code
-        var valid = True
-        for r in range(target, current, -1):
-            var d = digits % 7
-            digits /= 7
-            if starts_in_deleted_direction and d == 1 and digits == 0:
-                valid = False
-            value = set_digit(value, r, d)
-        if valid:
+        if not deleted_pentagon_child(value, target, current):
             dst[written] = value
             written += 1
+        if code + 1 < span:
+            value = increment_child(value, target, current)
     return written
+
+
+@export("mjh_cell_to_children_range")
+def mjh_cell_to_children_range(h: Int, target: Int, dst_addr: Int, dst_len: Int, start: Int, end: Int) abi("C") -> Int:
+    var current = resolution(h)
+    if not valid_cell(h) or target < current or target > 15:
+        return -1
+    var span = pow7(target - current)
+    if dst_addr == 0 or dst_len < span or start < 0 or end < start or end > span:
+        return -2
+    if has_pentagon_deleted_direction(h, current):
+        return -3
+    var dst = IPtr(unsafe_from_address=dst_addr)
+    write_hex_children(dst, h, target, current, start, end)
+    return end - start
 
 
 @export("mjh_great_circle_distance")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 from ._lib import lib
@@ -11,6 +12,8 @@ __version__ = "0.1.0"
 
 EARTH_RADIUS_KM = 6371.007180918475
 _PENTAGON_BASE_CELLS = (4, 14, 24, 38, 49, 58, 63, 72, 83, 97, 107, 117)
+_CHILD_PARALLEL_THRESHOLD = 262_144
+_CHILD_CHUNK = 131_072
 _AREA_KM2 = (
     4357449.416078383, 609788.4417941332, 86801.7803989972,
     12393.43465508816, 1770.347654491307, 252.9038581819449,
@@ -142,16 +145,31 @@ def cell_to_children_size(h, res=None):
 
 def cell_to_children(h, res=None):
     value = _require_cell(h)
-    current = get_resolution(value)
+    current = (value >> 52) & 15
     target = current + 1 if res is None else _require_res(res)
     if target < current:
         raise H3ResMismatchError("Child resolution must not be below cell resolution")
-    size = cell_to_children_size(value, target)
+    size = int(lib().mjh_cell_to_children_size(value, target))
     raw = np.empty(size, dtype=np.int64)
-    written = lib().mjh_cell_to_children(value, target, raw.ctypes.data, raw.size)
+    kernel = lib()
+    if size >= _CHILD_PARALLEL_THRESHOLD and not kernel.mjh_is_pentagon(value):
+        ranges = [(start, min(start + _CHILD_CHUNK, size))
+                  for start in range(0, size, _CHILD_CHUNK)]
+
+        def fill(bounds):
+            start, end = bounds
+            return kernel.mjh_cell_to_children_range(
+                value, target, raw.ctypes.data, raw.size, start, end,
+            )
+
+        with ThreadPoolExecutor(max_workers=min(8, len(ranges))) as pool:
+            counts = list(pool.map(fill, ranges))
+        written = sum(counts) if all(count >= 0 for count in counts) else -1
+    else:
+        written = kernel.mjh_cell_to_children(value, target, raw.ctypes.data, raw.size)
     if written != size:
         raise RuntimeError("Mojo child-generation kernel failed")
-    return [_cell(x) for x in raw[:written]]
+    return [format(x, "x") for x in raw.tolist()]
 
 
 def get_num_cells(res):

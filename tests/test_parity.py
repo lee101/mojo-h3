@@ -71,6 +71,21 @@ def test_pentagon_children_match_h3_across_five_resolutions():
     assert mh3.cell_to_children(cell, 10) == h3.cell_to_children(cell, 10)
 
 
+def test_children_simd_tail_matches_h3():
+    cell = h3.latlng_to_cell(37.775, -122.418, 8)
+    assert mh3.cell_to_children(cell, 10) == h3.cell_to_children(cell, 10)
+
+
+def test_children_parallel_threshold_matches_h3_samples():
+    cell = h3.latlng_to_cell(37.775, -122.418, 7)
+    target = 14
+    got = mh3.cell_to_children(cell, target)
+    expected = h3.cell_to_children(cell, target)
+    size = len(expected)
+    for i in (0, 1, size // 2, size - 2, size - 1):
+        assert got[i] == expected[i]
+
+
 @pytest.mark.parametrize("resolution", range(16))
 def test_num_cells_and_average_dimensions_match_h3(resolution):
     assert mh3.get_num_cells(resolution) == h3.get_num_cells(resolution)

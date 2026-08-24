@@ -58,26 +58,37 @@ under `pixi run python` from this checkout.
 
 ## Benchmarks
 
-Measured with `pixi run bench` on `x86_64`, Python 3.13.14, on 2026-08-02. Times are
+Measured with `pixi run bench` on `x86_64`, Python 3.13.14, on 2026-08-24. Times are
 the best of three runs except for the one-million-call upstream Python loop, which is
 measured once. The upstream package was `h3` 4.5.0.
 
 | kernel | mojo-h3 | h3 reference | speedup | comparison |
 | --- | ---: | ---: | ---: | --- |
-| great_circle_distance_batch 1M | 1087.81 ms | 2623.74 ms | 2.41x | h3 scalar Python calls |
-| cell_to_children res 7 -> 12 | 6.31 ms | 8.82 ms | 1.40x | H3 C extension |
-| pentagon children res 5 -> 10 | 5.27 ms | 7.32 ms | 1.39x | H3 C extension |
+| great_circle_distance_batch 1M | 163.71 ms | 2418.21 ms | 14.77x | h3 scalar Python calls |
+| cell_to_children res 7 -> 12 | 3.83 ms | 8.47 ms | 2.21x | H3 C extension |
+| pentagon children res 5 -> 10 | 2.95 ms | 7.07 ms | 2.40x | H3 C extension |
 
 The batch speedup is over repeated Python-to-C calls, not a claim against a hypothetical
 upstream vector API. Upstream has no batch great-circle-distance function.
+
+No GPU path is included. Child expansion is integer bit manipulation with one 8-byte
+output per cell, so it is below the arithmetic-intensity threshold where device transfer
+and launch costs can pay off. Great-circle distance is compute-intensive, but its CPU
+batch was already more than 5x ahead of the upstream scalar-call reference and was not
+an optimization target.
 
 ## How it works
 
 H3 cells encode mode, resolution, base cell, and fifteen three-bit hierarchy digits in
 one 64-bit word. The Mojo kernel validates that layout, including the deleted K-axis at
-each pentagon, then creates parents and children by editing only those bit fields. It
-writes children into a caller-owned contiguous `int64` NumPy buffer; ctypes passes that
-buffer's address to a fixed C ABI, so no per-child allocation crosses the boundary.
+each pentagon, then creates parents and children by editing only those bit fields. Hexagon
+children are generated in native-width SIMD groups with a scalar remainder; pentagons use
+an allocation-free base-7 odometer. Expansions above 262,144 children are divided into
+independent ranges and filled by up to eight GIL-free workers, while smaller requests stay
+serial. Children are written into a caller-owned contiguous `int64` NumPy buffer; ctypes
+passes that buffer's address to a fixed C ABI, so no per-child allocation crosses the
+boundary. The final hex conversion uses Python integers in one bulk `tolist()` conversion
+instead of boxing each NumPy scalar separately.
 
 The distance batch kernel receives two contiguous `(n, 2)` float64 arrays, converts no
 per-row Python objects, and evaluates the numerically stable haversine/`atan2` formula

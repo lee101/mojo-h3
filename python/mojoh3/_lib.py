@@ -21,6 +21,7 @@ _SIGNATURES = {
     "mjh_cell_to_center_child": ([I, I], I),
     "mjh_cell_to_children_size": ([I, I], I),
     "mjh_cell_to_children": ([I, I, I, I], I),
+    "mjh_cell_to_children_range": ([I, I, I, I, I, I], I),
     "mjh_great_circle_distance": ([F, F, F, F], F),
     "mjh_great_circle_distance_batch": ([I, I, I, I, I, I, I], I),
 }

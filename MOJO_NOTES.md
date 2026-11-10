@@ -30,6 +30,14 @@ toolchain bump rather than trusting this file.
   A hardcoded `comptime W = 4` is always valid and is often the better choice.
 - `SIMD` has no `.min()` / `.max()` methods. The free `min(a, b)` / `max(a, b)`
   work on both scalars and `SIMD` values.
+- **`@parameter for` does not exist on this toolchain.** `@parameter` on a `for` is a
+  hard error: `'for' statement does not support decorators; remove the decorator`.
+  `comptime for k in range(N):` does work (bodies are generated at compile time), but its
+  trip count must be a compile-time constant — `comptime for k in range(runtime_value)`
+  fails with `cannot use a dynamic value in comptime initializer`. A fixed small trip
+  count written literally, e.g. `comptime for k in range(4):`, is the usable spelling.
+- `List[Int]()` plus `.append(x)` works; `List[Int]` with `.append` fails
+  `use of uninitialized value`, and `std.algorithm` does not export `push_back`.
 
 ## 2. Export / FFI
 

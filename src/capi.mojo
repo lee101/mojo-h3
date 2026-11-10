@@ -102,29 +102,49 @@ def child_template(h: Int, target: Int, current: Int) -> Int:
     return value
 
 
-def child_from_code(base: Int, code: Int, target: Int, current: Int) -> Int:
-    var value = base
-    var digits = code
-    for r in range(target, current, -1):
-        value |= (digits % 7) << (3 * (15 - r))
-        digits /= 7
-    return value
-
-
 def write_hex_children(dst: IPtr, h: Int, target: Int, current: Int, start: Int, end: Int):
     comptime W = simdwidthof[DType.float64]()
     var base = child_template(h, target, current)
+    # Each digit r writes at bit 3*(15-r); compute that once per expansion instead of
+    # on both uses of every digit.
+    var digit_shift = List[Int]()
+    for r in range(target, current, -1):
+        digit_shift.append(3 * (15 - r))
+    var span = target - current
     var code = start
     while code + W <= end:
-        var codes = iota[DType.int, W](code)
+        var digits = iota[DType.int, W](code)
         var values = SIMD[DType.int, W](base)
-        for r in range(target, current, -1):
-            values |= (codes % 7) << (3 * (15 - r))
-            codes /= 7
-        dst.store(code, values)
+        var k = 0
+        # Two digit steps per iteration: the trip count is a runtime value, so the
+        # compiler cannot unroll this loop for us.
+        while k + 2 <= span:
+            var q0 = digits / 7
+            values |= (digits - q0 * 7) << SIMD[DType.int, W](digit_shift[k])
+            var q1 = q0 / 7
+            values |= (q0 - q1 * 7) << SIMD[DType.int, W](digit_shift[k + 1])
+            digits = q1
+            k += 2
+        if k < span:
+            var quotient = digits / 7
+            values |= (digits - quotient * 7) << SIMD[DType.int, W](digit_shift[k])
+        dst.unsafe_store(code, values)
         code += W
     while code < end:
-        dst[code] = child_from_code(base, code, target, current)
+        var value = base
+        var digits = code
+        var k = 0
+        while k + 2 <= span:
+            var q0 = digits // 7
+            value |= (digits - q0 * 7) << digit_shift[k]
+            var q1 = q0 // 7
+            value |= (q0 - q1 * 7) << digit_shift[k + 1]
+            digits = q1
+            k += 2
+        if k < span:
+            var quotient = digits // 7
+            value |= (digits - quotient * 7) << digit_shift[k]
+        dst.unsafe_store(code, value)
         code += 1
 
 
@@ -149,7 +169,9 @@ def deleted_pentagon_child(value: Int, target: Int, current: Int) -> Bool:
 def distance_rads(lat1: Float64, lng1: Float64, lat2: Float64, lng2: Float64) -> Float64:
     var dlat = (lat2 - lat1) * 0.5
     var dlng = (lng2 - lng1) * 0.5
-    var a = sin(dlat) * sin(dlat) + cos(lat1) * cos(lat2) * sin(dlng) * sin(dlng)
+    var sdlat = sin(dlat)
+    var sdlng = sin(dlng)
+    var a = sdlat * sdlat + cos(lat1) * cos(lat2) * sdlng * sdlng
     if a > 1.0:
         a = 1.0
     return 2.0 * atan2(sqrt(a), sqrt(1.0 - a))
@@ -259,6 +281,11 @@ def mjh_great_circle_distance_batch(a_addr: Int, a_len: Int, b_addr: Int, b_len:
     var a = FPtr(unsafe_from_address=a_addr)
     var b = FPtr(unsafe_from_address=b_addr)
     var dst = FPtr(unsafe_from_address=dst_addr)
+    # `n` is checked against both input lengths above and `dst_len >= n`, so every index
+    # below is in range; `unsafe_load` skips the redundant bounds trip in here.
     for i in range(n):
-        dst[i] = distance_rads(a[2 * i], a[2 * i + 1], b[2 * i], b[2 * i + 1])
+        dst[i] = distance_rads(
+            a.unsafe_load(2 * i), a.unsafe_load(2 * i + 1),
+            b.unsafe_load(2 * i), b.unsafe_load(2 * i + 1),
+        )
     return 0

@@ -68,6 +68,53 @@ measured once. The upstream package was `h3` 4.5.0.
 | cell_to_children res 7 -> 12 | 3.83 ms | 8.47 ms | 2.21x | H3 C extension |
 | pentagon children res 5 -> 10 | 2.95 ms | 7.07 ms | 2.40x | H3 C extension |
 
+### Unroll phase (same machine, same harness)
+
+`pixi run bench` end to end. "Before" is `pixi run bench` at the start of this phase;
+"after" is `pixi run bench` after the kernel changes. The same-machine `h3` reference
+column moves by more than the difference between these rows, so compare each mojo-h3
+number against the reference measured beside it, not across rows.
+
+| kernel | before | after | change | h3 reference beside "after" |
+| --- | ---: | ---: | ---: | ---: |
+| great_circle_distance_batch 1M | 138.39 ms | 135.27 ms | unchanged (within run-to-run spread) | 2632.65 ms |
+| cell_to_children res 7 -> 12 | 4.00 ms | 4.16 ms | unchanged (glue-dominated, see below) | 9.53 ms |
+| pentagon children res 5 -> 10 | 3.08 ms | 3.18 ms | unchanged (glue-dominated, see below) | 8.19 ms |
+
+End-to-end `cell_to_children` at these sizes is 93-95% Python `format()` and `tolist()`
+(`bench/analysis.md`), so the kernel gain is hidden: the 7 -> 12 call is 0.16 ms of
+kernel inside ~4 ms of conversion. The kernel-only numbers, measured directly on the
+C ABI in one process (best of 9, alternating old and new library), are:
+
+| kernel (C ABI, glue excluded) | before | after |
+| --- | ---: | ---: |
+| cell_to_children hex 7 -> 12 (16,807 cells) | 0.204 ms | 0.141 ms (1.46x) |
+| cell_to_children hex 7 -> 14 (823,543 cells, one core) | 14.45 ms | 10.53 ms (1.37x) |
+| pentagon children 5 -> 10 (14,006 cells) | 0.068 ms | 0.064 ms (1.06x) |
+| great_circle_distance_batch 1M (kernel only) | 106.2-110.8 ms | 106.2-111.3 ms (~1.00x) |
+
+What changed in the children kernel: the per-digit shift is built once per expansion
+instead of on every use, the group body and the scalar tail walk the digits with the same
+loop shape (two digit steps per iteration; the trip count is a runtime value, so Mojo
+cannot unroll it for us), and the helper the scalar tail used is gone. Output is
+bit-identical to the previous kernel, and to upstream, at every resolution.
+
+What did not pay on `great_circle_distance_batch`, and is therefore not in the code
+(each was measured, then reverted): hoisting `cos(lat1)` out of the row
+(sqrt(cos²) reconstruction, +5%), interleaving 4 rows as independent strips, splitting
+rows into 4 residue-class partial passes, walking the inputs with their own pointer,
+splitting into a latitude pass and a longitude pass, and the textbook
+`2*asin(sqrt(h))` form (+10% here, and it moves the last bits). The row is bound by its
+five transcendental calls: removing `sin`/`cos` takes it from 105 ms to 59 ms while
+removing `atan2` takes it to 68 ms, so there is no serial-accumulator chain left to
+break. The multi-accumulator technique therefore stays unused: no kernel in this port
+accumulates a sum.
+
+Results are bit-identical to the previous `cell_to_children` kernel. The batch distance
+kernel changes only that it writes its output element by element and skips a redundant
+bounds check per load; the summation order is unchanged and no tolerance changed. The
+batch distance stays within the existing 2e-15 relative of the `h3` scalar reference.
+
 The batch speedup is over repeated Python-to-C calls, not a claim against a hypothetical
 upstream vector API. Upstream has no batch great-circle-distance function.
 

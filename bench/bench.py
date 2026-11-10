@@ -26,6 +26,16 @@ def row(name, mojo_seconds, ref_seconds, reference):
     print(f"| {name} | {mojo_seconds * 1e3:.2f} ms | {ref_seconds * 1e3:.2f} ms | {speedup:.2f}x | {reference} |")
 
 
+def _with_workers(workers, latlng1, latlng2):
+    """Run the public batch wrapper at a fixed worker count, restoring the default after."""
+    previous = mh3._BATCH_WORKERS
+    mh3._BATCH_WORKERS = workers
+    try:
+        return mh3.great_circle_distance_batch(latlng1, latlng2)
+    finally:
+        mh3._BATCH_WORKERS = previous
+
+
 def main():
     rng = np.random.default_rng(0)
     n = 1_000_000
@@ -50,6 +60,17 @@ def main():
     mojo = best(lambda: mh3.cell_to_children(pentagon, 10))
     reference = best(lambda: h3.cell_to_children(pentagon, 10))
     row("pentagon children res 5 -> 10", mojo, reference, "H3 C extension")
+
+    # Serial control for the threaded batch path, and the sizes either side of the
+    # kernel's crossover (131,072 rows). Same harness, same lock.
+    print()
+    print("| serial control / crossover | mojo-h3 | serial control | speedup | comparison |")
+    print("| --- | ---: | ---: | ---: | --- |")
+    for n in (100_000, 1_000_000):
+        serial = best(lambda: _with_workers(1, first[:n], second[:n]))
+        threaded = best(lambda: _with_workers(8, first[:n], second[:n]))
+        row(f"great_circle_distance_batch {n // 1000}k, 8 workers vs 1",
+            threaded, serial, "serial control (same call, _BATCH_WORKERS=1)")
 
 
 if __name__ == "__main__":

@@ -1,10 +1,23 @@
 """C ABI for the H3 hierarchy and spherical-distance kernels."""
 
+from max.algorithm import parallelize
 from std.math import atan2, cos, iota, sin, sqrt
 from std.sys.info import simd_width_of as simdwidthof
 
 comptime IPtr = UnsafePointer[Int, AnyOrigin[mut=True]]
 comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
+
+
+# The batch-distance rows are independent, so a range of rows can be evaluated on its own.
+# The split rule and its threshold live here (not in the Python wrapper) so that every C
+# ABI caller gets the same serial/parallel decision. See README for the measurements that
+# set the numbers.
+comptime DIST_PARALLEL_THRESHOLD = 131072
+comptime DIST_MAX_WORKERS = 8
+comptime DIST_CHUNK = 8192
+comptime DIST_DEG_TO_RAD = 0.017453292519943295
+comptime DIST_HALF_DEG_TO_RAD = 0.5 * DIST_DEG_TO_RAD
+comptime DEG_TO_RAD = 0.017453292519943295
 
 comptime CELL_MODE = 1
 comptime MODE_SHIFT = 59
@@ -272,7 +285,72 @@ def mjh_great_circle_distance(lat1: Float64, lng1: Float64, lat2: Float64, lng2:
     return distance_rads(lat1, lng1, lat2, lng2)
 
 
-comptime DEG_TO_RAD = 0.017453292519943295
+def write_row_rads(a: FPtr, b: FPtr, dst: FPtr, i: Int):
+    dst[i] = distance_rads(
+        a.unsafe_load(2 * i), a.unsafe_load(2 * i + 1),
+        b.unsafe_load(2 * i), b.unsafe_load(2 * i + 1),
+    )
+
+
+def write_row_degsafe(a: FPtr, b: FPtr, dst: FPtr, i: Int):
+    # Degrees in, radians out. The differences are taken in degrees and scaled once, and
+    # the latitudes are scaled (not the half-difference) before cos(), so `v` clamps
+    # exactly where the radians-in path does.
+    var lat1 = a.unsafe_load(2 * i)
+    var lng1 = a.unsafe_load(2 * i + 1)
+    var lat2 = b.unsafe_load(2 * i)
+    var lng2 = b.unsafe_load(2 * i + 1)
+    var sdlat = sin((lat2 - lat1) * DIST_HALF_DEG_TO_RAD)
+    var sdlng = sin((lng2 - lng1) * DIST_HALF_DEG_TO_RAD)
+    var v = sdlat * sdlat + cos(lat1 * DIST_DEG_TO_RAD) * cos(lat2 * DIST_DEG_TO_RAD) * sdlng * sdlng
+    if v > 1.0:
+        v = 1.0
+    dst[i] = 2.0 * atan2(sqrt(v), sqrt(1.0 - v))
+
+
+def distance_rows_rads(a_addr: Int, b_addr: Int, dst_addr: Int, start: Int, end: Int):
+    var a = FPtr(unsafe_from_address=a_addr)
+    var b = FPtr(unsafe_from_address=b_addr)
+    var dst = FPtr(unsafe_from_address=dst_addr)
+    for i in range(start, end):
+        write_row_rads(a, b, dst, i)
+
+
+def distance_rows_degsafe(a_addr: Int, b_addr: Int, dst_addr: Int, start: Int, end: Int):
+    var a = FPtr(unsafe_from_address=a_addr)
+    var b = FPtr(unsafe_from_address=b_addr)
+    var dst = FPtr(unsafe_from_address=dst_addr)
+    for i in range(start, end):
+        write_row_degsafe(a, b, dst, i)
+
+
+def distance_batch_rads(a_addr: Int, b_addr: Int, n: Int, dst_addr: Int, workers: Int):
+    if workers <= 1 or n < DIST_PARALLEL_THRESHOLD:
+        # Below the crossover the serial scan wins: see README "Parallel phase".
+        distance_rows_rads(a_addr, b_addr, dst_addr, 0, n)
+    else:
+        var nchunks = (n + DIST_CHUNK - 1) // DIST_CHUNK
+
+        def work(chunk: Int) {imm}:
+            var start = chunk * DIST_CHUNK
+            var end = min(start + DIST_CHUNK, n)
+            distance_rows_rads(a_addr, b_addr, dst_addr, start, end)
+
+        parallelize(work, nchunks, workers)
+
+
+def distance_batch_degsafe(a_addr: Int, b_addr: Int, n: Int, dst_addr: Int, workers: Int):
+    if workers <= 1 or n < DIST_PARALLEL_THRESHOLD:
+        distance_rows_degsafe(a_addr, b_addr, dst_addr, 0, n)
+    else:
+        var nchunks = (n + DIST_CHUNK - 1) // DIST_CHUNK
+
+        def work(chunk: Int) {imm}:
+            var start = chunk * DIST_CHUNK
+            var end = min(start + DIST_CHUNK, n)
+            distance_rows_degsafe(a_addr, b_addr, dst_addr, start, end)
+
+        parallelize(work, nchunks, workers)
 
 
 @export("mjh_great_circle_distance_batch_degsafe")
@@ -281,27 +359,7 @@ def mjh_great_circle_distance_batch_degsafe(a_addr: Int, a_len: Int, b_addr: Int
         return -1
     if n > 0 and (a_addr == 0 or b_addr == 0 or dst_addr == 0):
         return -1
-    var a = FPtr(unsafe_from_address=a_addr)
-    var b = FPtr(unsafe_from_address=b_addr)
-    var dst = FPtr(unsafe_from_address=dst_addr)
-    # Degrees in, radians out. The differences are taken in degrees and scaled once, and
-    # the latitudes are scaled (not the half-difference) before cos(), so `v` clamps
-    # exactly where the radians-in path does.
-    comptime HALF_DEG_TO_RAD = 0.5 * DEG_TO_RAD
-    var i = 0
-    while i < n:
-        var lat1 = a.unsafe_load(2 * i)
-        var lng1 = a.unsafe_load(2 * i + 1)
-        var lat2 = b.unsafe_load(2 * i)
-        var lng2 = b.unsafe_load(2 * i + 1)
-        var sdlat = sin((lat2 - lat1) * HALF_DEG_TO_RAD)
-        var sdlng = sin((lng2 - lng1) * HALF_DEG_TO_RAD)
-        var cos_lat1 = cos(lat1 * DEG_TO_RAD)
-        var v = sdlat * sdlat + cos_lat1 * cos(lat2 * DEG_TO_RAD) * sdlng * sdlng
-        if v > 1.0:
-            v = 1.0
-        dst[i] = 2.0 * atan2(sqrt(v), sqrt(1.0 - v))
-        i += 1
+    distance_batch_degsafe(a_addr, b_addr, n, dst_addr, DIST_MAX_WORKERS)
     return 0
 
 
@@ -311,14 +369,22 @@ def mjh_great_circle_distance_batch(a_addr: Int, a_len: Int, b_addr: Int, b_len:
         return -1
     if n > 0 and (a_addr == 0 or b_addr == 0 or dst_addr == 0):
         return -1
-    var a = FPtr(unsafe_from_address=a_addr)
-    var b = FPtr(unsafe_from_address=b_addr)
-    var dst = FPtr(unsafe_from_address=dst_addr)
     # `n` is checked against both input lengths above and `dst_len >= n`, so every index
     # below is in range; `unsafe_load` skips the redundant bounds trip in here.
-    for i in range(n):
-        dst[i] = distance_rads(
-            a.unsafe_load(2 * i), a.unsafe_load(2 * i + 1),
-            b.unsafe_load(2 * i), b.unsafe_load(2 * i + 1),
-        )
+    distance_batch_rads(a_addr, b_addr, n, dst_addr, DIST_MAX_WORKERS)
+    return 0
+
+
+@export("mjh_great_circle_distance_batch_degsafe_workers")
+def mjh_great_circle_distance_batch_degsafe_workers(a_addr: Int, a_len: Int, b_addr: Int, b_len: Int, n: Int, dst_addr: Int, dst_len: Int, workers: Int) abi("C") -> Int:
+    if n < 0 or a_len < 2 * n or b_len < 2 * n or dst_len < n:
+        return -1
+    if n > 0 and (a_addr == 0 or b_addr == 0 or dst_addr == 0):
+        return -1
+    var worker_count = workers
+    if worker_count < 1:
+        worker_count = 1
+    if worker_count > DIST_MAX_WORKERS:
+        worker_count = DIST_MAX_WORKERS
+    distance_batch_degsafe(a_addr, b_addr, n, dst_addr, worker_count)
     return 0

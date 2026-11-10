@@ -28,6 +28,9 @@ _EDGE_KM = (
     0.075863783, 0.028663897, 0.010830188, 0.00409201, 0.0015461,
     0.000584169,
 )
+# Worker count for the parallel batch distance path. Kept as a module attribute so the
+# tests and benchmarks can pin it (1 = serial); the kernel caps it at 8.
+_BATCH_WORKERS = 8
 
 
 class H3BaseException(ValueError):
@@ -227,16 +230,19 @@ def great_circle_distance_batch(latlng1, latlng2, unit="km"):
     if a.dtype != np.dtype(np.float64) or b.dtype != np.dtype(np.float64):
         raise TypeError("latitude/longitude arrays must have dtype float64")
     # These local arrays remain strongly referenced until the C call returns.
-    a = np.ascontiguousarray(a)
-    b = np.ascontiguousarray(b)
+    if not a.flags.c_contiguous:
+        a = np.ascontiguousarray(a)
+    if not b.flags.c_contiguous:
+        b = np.ascontiguousarray(b)
     # Degrees go straight into the kernel: the degree->radian scaling is fused into the
     # row, so the two 16-byte-per-row np.radians copies are gone. The kernel subtracts in
     # degrees and scales once, which is within ~1e-15 relative of the previous
-    # radians-in path (and slightly closer to the exact difference).
+    # radians-in path (and slightly closer to the exact difference). The kernel chooses
+    # serial or threaded from n, and the row order is the same either way.
     radians = np.empty(a.shape[0], dtype=np.float64)
-    status = lib().mjh_great_circle_distance_batch_degsafe(
+    status = lib().mjh_great_circle_distance_batch_degsafe_workers(
         a.ctypes.data, a.size, b.ctypes.data, b.size,
-        a.shape[0], radians.ctypes.data, radians.size,
+        a.shape[0], radians.ctypes.data, radians.size, _BATCH_WORKERS,
     )
     if status:
         raise RuntimeError("Mojo distance-batch kernel failed")

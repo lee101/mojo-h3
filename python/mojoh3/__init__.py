@@ -229,10 +229,13 @@ def great_circle_distance_batch(latlng1, latlng2, unit="km"):
     # These local arrays remain strongly referenced until the C call returns.
     a = np.ascontiguousarray(a)
     b = np.ascontiguousarray(b)
+    # Degrees go straight into the kernel: the degree->radian scaling is fused into the
+    # row, so the two 16-byte-per-row np.radians copies are gone. The kernel subtracts in
+    # degrees and scales once, which is within ~1e-15 relative of the previous
+    # radians-in path (and slightly closer to the exact difference).
     radians = np.empty(a.shape[0], dtype=np.float64)
-    radians_a, radians_b = np.radians(a), np.radians(b)
-    status = lib().mjh_great_circle_distance_batch(
-        radians_a.ctypes.data, radians_a.size, radians_b.ctypes.data, radians_b.size,
+    status = lib().mjh_great_circle_distance_batch_degsafe(
+        a.ctypes.data, a.size, b.ctypes.data, b.size,
         a.shape[0], radians.ctypes.data, radians.size,
     )
     if status:

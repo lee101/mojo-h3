@@ -116,6 +116,73 @@ def test_batch_distance_matches_h3_scalar_reference():
     assert mh3.great_circle_distance_batch(first, second, "km") == pytest.approx(ref, rel=2e-15)
 
 
+def _scalar_distance_km(rows, other_rows):
+    """Per-row h3 scalar reference, so a tail leak can be attributed to one index."""
+    return np.array([h3.great_circle_distance(a, b, "km") for a, b in zip(rows, other_rows)])
+
+
+@pytest.mark.parametrize("n", [0, 1, 2, 3, 4, 5, 7, 8, 9, 1003, 20001])
+def test_batch_distance_tail_lengths(n):
+    """0, W-1, W, W+1 and large odd n, so every vector-body/tail split is exercised.
+
+    Every row is compared with h3, index by index. A pad probe is what catches a tail
+    leak; this test catches a wrong or misaligned row at any length.
+    """
+    rng = np.random.default_rng(1000 + n)
+    first = np.column_stack((rng.uniform(-89, 89, n), rng.uniform(-180, 180, n)))
+    second = np.column_stack((rng.uniform(-89, 89, n), rng.uniform(-180, 180, n)))
+    got = mh3.great_circle_distance_batch(first, second, "km")
+    assert got.shape == (n,)
+    if n == 0:
+        return
+    ref = _scalar_distance_km(first, second)
+    assert np.all(np.isfinite(got))
+    # The fused kernel subtracts in degrees and scales once, so it is not bit-identical to
+    # h3's radians-in form; 1e-13 relative covers that on 20k random rows and still fails
+    # a misaligned row by many orders of magnitude.
+    assert got == pytest.approx(ref, rel=1e-13, abs=1e-300)
+
+
+def test_batch_distance_empty_and_antipodal_rows():
+    got = mh3.great_circle_distance_batch(np.zeros((0, 2)), np.zeros((0, 2)))
+    assert got.shape == (0,)
+    pairs = [((0.0, 0.0), (0.0, 0.0)), ((0.0, 0.0), (0.0, 180.0)),
+             ((90.0, 0.0), (-90.0, 37.0)), ((89.99999999999999, 0.0), (-89.99999999999999, 179.99999999999997))]
+    first = np.array([p[0] for p in pairs])
+    second = np.array([p[1] for p in pairs])
+    got = mh3.great_circle_distance_batch(first, second, "km")
+    assert np.all(np.isfinite(got)) and got.min() >= 0.0
+    ref = _scalar_distance_km(first, second)
+    assert got == pytest.approx(ref, rel=1e-14, abs=1e-12)
+
+
+def test_batch_distance_noncontiguous_strided_inputs():
+    """The wrapper copies strided views, so the kernel only ever sees contiguous buffers;
+    this pins that the copy is reflected in the answer, at a tail length."""
+    rng = np.random.default_rng(7)
+    wide_a = np.column_stack((rng.uniform(-89, 89, 13), rng.uniform(-89, 89, 13), rng.uniform(-180, 180, 13)))
+    wide_b = np.column_stack((rng.uniform(-89, 89, 13), rng.uniform(-89, 89, 13), rng.uniform(-180, 180, 13)))
+    a = wide_a[:, ::2]
+    b = wide_b[:, ::2]
+    assert not a.flags.c_contiguous
+    got = mh3.great_circle_distance_batch(a, b, "km")
+    assert got == pytest.approx(_scalar_distance_km(a, b), rel=2e-15)
+
+
+def test_batch_distance_kernel_does_not_write_past_n():
+    """A vector body that rounds n up would scribble into the tail of the output buffer."""
+    rng = np.random.default_rng(11)
+    n, padded = 1003, 1003 + 8
+    first = np.column_stack((rng.uniform(-89, 89, n), rng.uniform(-180, 180, n)))
+    second = np.column_stack((rng.uniform(-89, 89, n), rng.uniform(-180, 180, n)))
+    out = np.full(padded, -12345.0)
+    status = lib().mjh_great_circle_distance_batch_degsafe(
+        first.ctypes.data, first.size, second.ctypes.data, second.size, n, out.ctypes.data, n,
+    )
+    assert status == 0
+    assert np.all(out[n:] == -12345.0)
+
+
 def test_error_cases_follow_h3_shape():
     with pytest.raises(mh3.H3CellInvalidError):
         mh3.cell_to_parent("not-a-cell")

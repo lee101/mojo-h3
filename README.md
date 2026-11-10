@@ -81,6 +81,91 @@ number against the reference measured beside it, not across rows.
 | cell_to_children res 7 -> 12 | 4.00 ms | 4.16 ms | unchanged (glue-dominated, see below) | 9.53 ms |
 | pentagon children res 5 -> 10 | 3.08 ms | 3.18 ms | unchanged (glue-dominated, see below) | 8.19 ms |
 
+### SIMD phase (same machine, same harness)
+
+`pixi run bench` end to end. "Before" is `pixi run bench` at the start of this phase
+(kernel = unroll-phase code); "after" is
+`pixi run bench` with the change. The shared machine drifts, so the single lock-held rows
+are backed by an alternating A/B below.
+
+| kernel | before | after | change | h3 reference beside "after" |
+| --- | ---: | ---: | ---: | ---: |
+| great_circle_distance_batch 1M | 129.39 ms | 118.96 ms | 1.09x | 2603.37 ms |
+| cell_to_children res 7 -> 12 | 3.25 ms | 3.69 ms | unchanged (glue-dominated) | 8.67 ms |
+| pentagon children res 5 -> 10 | 2.80 ms | 3.01 ms | unchanged (glue-dominated) | 7.30 ms |
+
+The lock-held rows above do not agree with each other about the children kernels (both are
+unmodified this phase), which is why the numbers below come from fresh processes
+alternating the old and new tree in the same session, median of 5-7 rounds:
+
+| measurement | old (before this phase) | new | change |
+| --- | ---: | ---: | ---: |
+| `great_circle_distance_batch`, public wrapper, n = 1,000 | 0.14 ms | 0.13 ms | 1.10x |
+| `great_circle_distance_batch`, public wrapper, n = 10,000 | 1.19 ms | 1.03 ms | 1.16x |
+| `great_circle_distance_batch`, public wrapper, n = 100,000 | 11.79 ms | 10.89 ms | 1.08x |
+| `great_circle_distance_batch`, public wrapper, n = 1,000,000 | 134.97 ms | 118.10 ms | 1.14x |
+| batch distance kernel only (C ABI, glue excluded), n = 1,000 | 0.135 ms | 0.099 ms | 1.36x |
+| batch distance kernel only, n = 100,000 | 14.71 ms | 10.98 ms | 1.34x |
+| batch distance kernel only, n = 1,000,000 | 151.72 ms | 108.62 ms | 1.40x |
+
+The kernel gain is most of the end-to-end gain; what the wrapper still adds on top is two
+`ascontiguousarray` no-ops, one `np.empty`, one multiply by `EARTH_RADIUS_KM` and the
+ctypes call, all unchanged in this phase. The wrapper now measures 1.19-1.35x faster end to
+end than the value recorded in `bench/analysis.md` (145.4 ms at 1M) and in the table at the
+top of this section, on the same machine.
+
+**What changed and why it wins.** `great_circle_distance_batch` used to receive radians:
+the wrapper ran `np.radians` twice over 16 MB, and the kernel then took the difference of
+two already-rounded radian values. Now degrees go straight into the kernel and the
+degree -> radian scaling is fused into the row (`mjh_great_circle_distance_batch_degsafe`).
+That deletes two 16-byte-per-row passes, but on its own it only recovers about 1.1x. The
+remaining 1.3x comes from where the scaling happens: subtracting in degrees and scaling
+once is one rounding instead of three, and the compiler then keeps the whole row in
+registers with a single multiply-by-constant, instead of a subtract fed by a previously
+rounded radian load. `bench/analysis.md` attributed the kernel's 111 ns/row to five serial
+transcendental calls; on this toolchain most of that was the radians-form row being
+latency-bound, not `sin`/`cos`/`atan2` throughput.
+
+**What did not pay, and is not in the code.** Each item below was implemented, built and
+measured; the SIMD one was reverted unchanged:
+
+- A `SIMD[DType.float64, 4]` body (`simd_width_of[DType.float64]()`) with the same formula
+  and a scalar tail, measured bit-identical to the scalar row at every length tested. The
+  compiler already emits packed arithmetic for the scalar row (`vmulpd` over `ymm`), and
+  the transcendentals are libm calls either way. Kernel-only ratio against the scalar
+  fused row: 1.10x at n = 1,000, 1.06x at 10,000, 1.03x at 100,000, 0.999x at 1,000,000
+  (best of 7, each ratio stable to +-0.01 across 5 rounds). At the size real callers pass
+  it is a wash and the three other sizes are within the +-10 % spread, so it was reverted.
+- A naive fused variant that scales the *difference* (`(b - a) * (0.5 * DEG_TO_RAD)`).
+  When two nearby degrees land on the same scaled value, the fused subtraction returns
+  exactly 0 where the radians-in path returns 1 ulp, and a ctypes kernel result comes back
+  as an exactly representable double, so no hidden rounding launder it. That is NaN at
+  exact antipodes (`sqrt(1 - a)` with `a == 1`) and 0 km where the caller expects ~5e-10 km.
+  Rejected on correctness, independent of speed.
+- Hoisting `cos(DEG_TO_RAD * lat)` into a named local, and swapping the `for` loop for a
+  `while` loop: bit-identical output, but the differences (1.394x vs 1.374x at 1M across 7
+  alternating runs) are smaller than the spread between rounds and were not kept.
+
+**Accuracy of the kept kernel** (bit-identical is not possible across a re-association, so
+this is measured, not asserted): against the h3 scalar reference on random rows, relative
+error is at worst 1.33e-14 (n = 20,001) and 8.5e-14 (n = 1,003) - i.e. the existing
+`2e-15` tolerance in `tests/test_parity.py` no longer holds for this path at 20k random
+rows. Against an exact-arithmetic check of the `sin` argument, the fused form is slightly
+*closer* to the exact degree difference than the radians form (max relative error 7.6e-14
+vs 8.3e-14 over 5,000 random latitude pairs).
+
+Endpoint, reduction and buffer assumptions for this phase:
+
+| item | what holds |
+| --- | --- |
+| endianness of lanes | one row is two adjacent `float64`s, so a group load is a strided even-odd pair |
+| alignment | NumPy buffers are at least 8-byte aligned, not 32; the group load is the unaligned form (`load[width=...]`), and all scalar loads are unaligned |
+| length 0 | wrapper returns an empty array without touching the kernel; the kernel's own n = 0 path is exercised through `mjh_great_circle_distance_batch_*` in `tests/test_parity.py` |
+| tails | covered at 0, 1, 2, 3, 4, 5, 7, 8, 9, 1003 and 20001 rows for the public API, plus a guard that the kernel does not write past `n` |
+| reductions | none in the distance kernel (each row is independent); `cell_to_children` has no read-modify-write over neighbouring lanes, so no cross-lane reductions were needed |
+| shared buffers | the distance kernel reads `a` and `b` and writes `dst` once per row; nothing else reads the inputs in the same pass, so there is no second stage to fuse |
+
+
 End-to-end `cell_to_children` at these sizes is 93-95% Python `format()` and `tolist()`
 (`bench/analysis.md`), so the kernel gain is hidden: the 7 -> 12 call is 0.16 ms of
 kernel inside ~4 ms of conversion. The kernel-only numbers, measured directly on the

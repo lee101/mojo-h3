@@ -272,6 +272,39 @@ def mjh_great_circle_distance(lat1: Float64, lng1: Float64, lat2: Float64, lng2:
     return distance_rads(lat1, lng1, lat2, lng2)
 
 
+comptime DEG_TO_RAD = 0.017453292519943295
+
+
+@export("mjh_great_circle_distance_batch_degsafe")
+def mjh_great_circle_distance_batch_degsafe(a_addr: Int, a_len: Int, b_addr: Int, b_len: Int, n: Int, dst_addr: Int, dst_len: Int) abi("C") -> Int:
+    if n < 0 or a_len < 2 * n or b_len < 2 * n or dst_len < n:
+        return -1
+    if n > 0 and (a_addr == 0 or b_addr == 0 or dst_addr == 0):
+        return -1
+    var a = FPtr(unsafe_from_address=a_addr)
+    var b = FPtr(unsafe_from_address=b_addr)
+    var dst = FPtr(unsafe_from_address=dst_addr)
+    # Degrees in, radians out. The differences are taken in degrees and scaled once, and
+    # the latitudes are scaled (not the half-difference) before cos(), so `v` clamps
+    # exactly where the radians-in path does.
+    comptime HALF_DEG_TO_RAD = 0.5 * DEG_TO_RAD
+    var i = 0
+    while i < n:
+        var lat1 = a.unsafe_load(2 * i)
+        var lng1 = a.unsafe_load(2 * i + 1)
+        var lat2 = b.unsafe_load(2 * i)
+        var lng2 = b.unsafe_load(2 * i + 1)
+        var sdlat = sin((lat2 - lat1) * HALF_DEG_TO_RAD)
+        var sdlng = sin((lng2 - lng1) * HALF_DEG_TO_RAD)
+        var cos_lat1 = cos(lat1 * DEG_TO_RAD)
+        var v = sdlat * sdlat + cos_lat1 * cos(lat2 * DEG_TO_RAD) * sdlng * sdlng
+        if v > 1.0:
+            v = 1.0
+        dst[i] = 2.0 * atan2(sqrt(v), sqrt(1.0 - v))
+        i += 1
+    return 0
+
+
 @export("mjh_great_circle_distance_batch")
 def mjh_great_circle_distance_batch(a_addr: Int, a_len: Int, b_addr: Int, b_len: Int, n: Int, dst_addr: Int, dst_len: Int) abi("C") -> Int:
     if n < 0 or a_len < 2 * n or b_len < 2 * n or dst_len < n:

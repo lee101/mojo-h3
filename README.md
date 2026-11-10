@@ -203,11 +203,26 @@ batch distance stays within the existing 2e-15 relative of the `h3` scalar refer
 The batch speedup is over repeated Python-to-C calls, not a claim against a hypothetical
 upstream vector API. Upstream has no batch great-circle-distance function.
 
-No GPU path is included. Child expansion is integer bit manipulation with one 8-byte
-output per cell, so it is below the arithmetic-intensity threshold where device transfer
-and launch costs can pay off. Great-circle distance is compute-intensive, but its CPU
-batch was already more than 5x ahead of the upstream scalar-call reference and was not
-an optimization target.
+### GPU phase: skipped, no GPU path
+
+No GPU path is included, and none was written or benchmarked in this phase. Two
+independent gates both failed:
+
+- **Arithmetic intensity.** The gate admits kernels above roughly 2 flops/byte. The
+  highest figure anywhere in `bench/analysis.md` is `great_circle_distance_batch` at
+  **0.48 flops/byte**, and that is an *upper bound* (transcendentals counted as 1 flop).
+  `cell_to_children` is ~0.6 flops/byte. Per the gate rule, both are **CPU only:
+  memory-bound** at the sizes callers pass, so there is no candidate to port.
+- **Shared device capacity.** `nvidia-smi --query-gpu=memory.free --format=csv,noheader`
+  on this host (2026-11-10, RTX 5090 32 GB, 13 other processes resident) reported
+  **3550 MiB free**, under the 4000 MiB floor. The phase is skipped on that basis too.
+
+Because no GPU code was written, there are no before/after GPU numbers to record, no GPU
+path to fall back from, and no GPU tests to skip: the existing suite is CPU-only and runs
+exactly as before. Should the device later have headroom, the distance batch is the only
+plausible candidate (its kernel is ~110 ns/row on one core, bound by five transcendental
+calls per row), but at 0.48 flops/byte it would first need to be re-measured against the
+2 flops/byte gate rather than assumed to benefit from a transfer.
 
 ## How it works
 

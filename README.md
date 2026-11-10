@@ -58,15 +58,27 @@ under `pixi run python` from this checkout.
 
 ## Benchmarks
 
-Measured with `pixi run bench` on `x86_64`, Python 3.13.14, on 2026-08-24. Times are
+Measured with `pixi run bench` on `x86_64`, Python 3.13.14, on 2026-11-10. Times are
 the best of three runs except for the one-million-call upstream Python loop, which is
 measured once. The upstream package was `h3` 4.5.0.
 
 | kernel | mojo-h3 | h3 reference | speedup | comparison |
 | --- | ---: | ---: | ---: | --- |
-| great_circle_distance_batch 1M | 163.71 ms | 2418.21 ms | 14.77x | h3 scalar Python calls |
-| cell_to_children res 7 -> 12 | 3.83 ms | 8.47 ms | 2.21x | H3 C extension |
-| pentagon children res 5 -> 10 | 2.95 ms | 7.07 ms | 2.40x | H3 C extension |
+| great_circle_distance_batch 1M | 29.25 ms (22.65-78.85) | 2646.50 ms (2509.69-3031.53) | 90.48x (observed 35.97-124.65) | h3 scalar Python calls |
+| cell_to_children res 7 -> 12 | 4.86 ms (3.86-8.55) | 10.33 ms (9.32-12.13) | 2.13x (observed 1.42-2.50) | H3 C extension |
+| pentagon children res 5 -> 10 | 3.85 ms (3.18-4.40) | 8.33 ms (7.77-9.57) | 2.16x (observed 2.16-2.46) | H3 C extension |
+
+These are the VERIFY-phase measurements: median of 11 independent `pixi run bench`
+sessions, range in parentheses (the minimum and maximum both occurred on heavily loaded
+runs; the children rows moved by up to 2x between sessions while their reference moved
+with them). The speedup column is median-over-median; the observed
+range pairs each session's own two numbers. This is a shared host (load average 17-23),
+so the ranges are wide. The batch row runs on the 8-worker parallel path
+(`_BATCH_WORKERS = 8`) that the parallel phase added after the SIMD figures below were
+recorded: most of its speedup over the pre-parallel tree is that split, not the arithmetic
+change (see the kernel-only table below). The same input rows feed both sides of
+every row, and the harness keeps every timed output and checks it, so no row is skipped on
+one side.
 
 ### Unroll phase (same machine, same harness)
 
@@ -154,6 +166,12 @@ rows. Against an exact-arithmetic check of the `sin` argument, the fused form is
 *closer* to the exact degree difference than the radians form (max relative error 7.6e-14
 vs 8.3e-14 over 5,000 random latitude pairs).
 
+*VERIFY correction (2026-11-10):* the figures above did not reproduce in this session.
+On `np.random.default_rng(0)` uniform rows, the maximum relative difference from the h3
+scalar reference is 1.8e-15 at n = 1,003 and 2.6e-14 at n = 20,001; at 1,000,000 rows it is
+4.6e-14 (the `pixi run bench` self-check reads the same 4.57e-14 every session), and at
+200,001 rows 7.5e-14. The conclusion stands: `2e-15` does not hold on large random batches.
+
 Endpoint, reduction and buffer assumptions for this phase:
 
 | item | what holds |
@@ -163,20 +181,36 @@ Endpoint, reduction and buffer assumptions for this phase:
 | length 0 | wrapper returns an empty array without touching the kernel; the kernel's own n = 0 path is exercised through `mjh_great_circle_distance_batch_*` in `tests/test_parity.py` |
 | tails | covered at 0, 1, 2, 3, 4, 5, 7, 8, 9, 1003 and 20001 rows for the public API, plus a guard that the kernel does not write past `n` |
 | reductions | none in the distance kernel (each row is independent); `cell_to_children` has no read-modify-write over neighbouring lanes, so no cross-lane reductions were needed |
-| shared buffers | the distance kernel reads `a` and `b` and writes `dst` once per row; nothing else reads the inputs in the same pass, so there is no second stage to fuse |
+| shared buffers | the distance kernel reads `a` and `b` and writes `dst` once per row; above the parallel threshold the 8 workers read disjoint row slices and write disjoint output slices of the same three buffers concurrently, with no read of one worker's output by another. VERIFY measured worker counts 1, 2, 3, 7 and 8 on a 140,003-row batch (last chunk partial) as bit-identical to the serial result and within 1e-12 relative of h3, every row |
 
 
 End-to-end `cell_to_children` at these sizes is 93-95% Python `format()` and `tolist()`
-(`bench/analysis.md`), so the kernel gain is hidden: the 7 -> 12 call is 0.16 ms of
-kernel inside ~4 ms of conversion. The kernel-only numbers, measured directly on the
-C ABI in one process (best of 9, alternating old and new library), are:
+(`bench/analysis.md`), so the kernel gain is hidden: the 7 -> 12 call is ~0.15-0.35 ms of
+kernel inside ~4-5 ms of conversion. The kernel-only numbers, measured directly on the
+C ABI in fresh processes alternating the pre-phase library (ef9f512) and the current one
+(best of 9, 3 alternating rounds):
 
-| kernel (C ABI, glue excluded) | before | after |
-| --- | ---: | ---: |
-| cell_to_children hex 7 -> 12 (16,807 cells) | 0.204 ms | 0.141 ms (1.46x) |
-| cell_to_children hex 7 -> 14 (823,543 cells, one core) | 14.45 ms | 10.53 ms (1.37x) |
-| pentagon children 5 -> 10 (14,006 cells) | 0.068 ms | 0.064 ms (1.06x) |
-| great_circle_distance_batch 1M (kernel only) | 106.2-110.8 ms | 106.2-111.3 ms (~1.00x) |
+| kernel (C ABI, glue excluded) | before | after | change |
+| --- | ---: | ---: | ---: |
+| cell_to_children hex 7 -> 12 (16,807 cells) | 0.148-0.149 ms | 0.145-0.344 ms | unchanged (range overlaps) |
+| cell_to_children hex 7 -> 14 (823,543 cells, one core) | 9.78-10.34 ms | 10.46-10.59 ms | unchanged; 3-7% slower in this window |
+| pentagon children 5 -> 10 (14,006 cells) | 0.068-0.131 ms | 0.060-0.062 ms | ~1.1x (before range is the wider one) |
+| great_circle_distance_batch 1M (rads-in, kernel only) | 147.8-157.5 ms | 25.6-30.5 ms | not like for like: the current entry point uses 8 workers |
+
+The 1M distance row is not a kernel comparison: the current `mjh_great_circle_distance_batch`
+threads above 131,072 rows while the pre-phase kernel was serial. Measured in fresh
+processes, one library each, `pixi run bench`'s own kernel-only rows are:
+
+| kernel only (C ABI) | measured (best of 9, 10 sessions) |
+| --- | ---: |
+| great_circle_distance_batch 1M, rads-in, kernel max workers | 29.3-33.0 ms |
+| great_circle_distance_batch 1M, degsafe, 1 worker | 104.6-113.7 ms |
+| great_circle_distance_batch 1M, degsafe, 8 workers | 22.1-25.4 ms |
+
+So the degsafe row is about 1.3-1.45x faster than the radians row single-threaded, which
+is close to the ~1.4x claimed for the SIMD phase, but most of the end-to-end batch win over
+the pre-parallel tree comes from the 8 worker split (old public path 221.6-372.3 ms new
+23.8-56.5 ms, three fresh processes each side), not from the arithmetic change.
 
 What changed in the children kernel: the per-digit shift is built once per expansion
 instead of on every use, the group body and the scalar tail walk the digits with the same

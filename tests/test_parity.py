@@ -156,6 +156,35 @@ def test_batch_distance_empty_and_antipodal_rows():
     assert got == pytest.approx(ref, rel=1e-14, abs=1e-12)
 
 
+@pytest.mark.parametrize("workers", [1, 2, 3, 7])
+def test_batch_distance_parallel_matches_upstream(workers):
+    """Every row must match h3 at non-default worker counts, above the parallel threshold.
+
+    n is just over the threshold and not a multiple of the chunk, so the last parallel
+    chunk is a partial one. A row dropped or duplicated by the split shows up here.
+    """
+    rng = np.random.default_rng(21 + workers)
+    n = 140_003
+    first = np.column_stack((rng.uniform(-89, 89, n), rng.uniform(-180, 180, n)))
+    second = np.column_stack((rng.uniform(-89, 89, n), rng.uniform(-180, 180, n)))
+    previous = mh3._BATCH_WORKERS
+    mh3._BATCH_WORKERS = workers
+    try:
+        got = mh3.great_circle_distance_batch(first, second, "km")
+    finally:
+        mh3._BATCH_WORKERS = previous
+    ref = _scalar_distance_km(first, second)
+    assert got.shape == (n,)
+    assert got == pytest.approx(ref, rel=1e-12)
+    # Same rows whatever the worker count: the split must not change the answer.
+    mh3._BATCH_WORKERS = 1
+    try:
+        serial = mh3.great_circle_distance_batch(first, second, "km")
+    finally:
+        mh3._BATCH_WORKERS = previous
+    assert np.array_equal(got, serial)
+
+
 def test_batch_distance_noncontiguous_strided_inputs():
     """The wrapper copies strided views, so the kernel only ever sees contiguous buffers;
     this pins that the copy is reflected in the answer, at a tail length."""
@@ -176,8 +205,10 @@ def test_batch_distance_kernel_does_not_write_past_n():
     first = np.column_stack((rng.uniform(-89, 89, n), rng.uniform(-180, 180, n)))
     second = np.column_stack((rng.uniform(-89, 89, n), rng.uniform(-180, 180, n)))
     out = np.full(padded, -12345.0)
+    # Declare the whole padded buffer as the destination; with dst_len == n the kernel's
+    # own length check would mask an overrun, so only a real write past n is caught here.
     status = lib().mjh_great_circle_distance_batch_degsafe(
-        first.ctypes.data, first.size, second.ctypes.data, second.size, n, out.ctypes.data, n,
+        first.ctypes.data, first.size, second.ctypes.data, second.size, n, out.ctypes.data, padded,
     )
     assert status == 0
     assert np.all(out[n:] == -12345.0)
